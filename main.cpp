@@ -1,11 +1,15 @@
 #include <QAction>
 #include <QApplication>
 #include <QByteArray>
+#include <QColor>
 #include <QCommandLineParser>
+#include <QFileInfo>
 #include <QIcon>
 #include <QMenu>
+#include <QPainter>
 #include <QPointer>
 #include <QProcess>
+#include <QPixmap>
 #include <QSocketNotifier>
 #include <QStyle>
 #include <QSystemTrayIcon>
@@ -23,16 +27,76 @@
 #include <time.h>
 #include <utility>
 
-static QIcon themed_icon(const QStringList &names)
+static constexpr const int ICON_SIZE = 64;
+static constexpr const qreal STATUS_DOT_DIAMETER = 20.0;
+static constexpr const qreal STATUS_DOT_BORDER_WIDTH = 3.0;
+static constexpr const qreal STATUS_DOT_MARGIN = 2.0;
+
+static QPixmap rasterize_icon(const QIcon &icon)
 {
-    for (const auto &name : names) {
-        auto icon = QIcon::fromTheme(name);
-        if (!icon.isNull()) {
-            return icon;
+    const QSize size(ICON_SIZE, ICON_SIZE);
+    if (icon.pixmap(size, 1.0).isNull()) {
+        return {};
+    }
+
+    QPixmap pixmap(size);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    icon.paint(&painter, pixmap.rect());
+    return pixmap;
+}
+
+static QIcon default_base_icon()
+{
+    QPixmap pixmap = rasterize_icon(QIcon::fromTheme("applications-system"));
+    if (pixmap.isNull()) {
+        pixmap = rasterize_icon(
+            QApplication::style()->standardIcon(QStyle::SP_ComputerIcon));
+    }
+
+    return QIcon(pixmap);
+}
+
+static QIcon load_base_icon(const QString &path)
+{
+    if (path.isEmpty()) {
+        return default_base_icon();
+    }
+
+    const QFileInfo icon_file(path);
+    if (icon_file.isFile() && icon_file.isReadable()) {
+        const QPixmap pixmap = rasterize_icon(QIcon(icon_file.absoluteFilePath()));
+        if (!pixmap.isNull()) {
+            return QIcon(pixmap);
         }
     }
 
-    return QApplication::style()->standardIcon(QStyle::SP_ComputerIcon);
+    qWarning("Could not load icon '%s'; using the default icon.", qUtf8Printable(path));
+    return default_base_icon();
+}
+
+static QIcon render_status_icon(const QIcon &base_icon, const QColor &status_color)
+{
+    QPixmap pixmap = base_icon.pixmap(QSize(ICON_SIZE, ICON_SIZE), 1.0);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setBrush(status_color);
+    painter.setPen(QPen(Qt::white, STATUS_DOT_BORDER_WIDTH));
+
+    const QRectF outer_rect(
+        ICON_SIZE - STATUS_DOT_MARGIN - STATUS_DOT_DIAMETER,
+        ICON_SIZE - STATUS_DOT_MARGIN - STATUS_DOT_DIAMETER,
+        STATUS_DOT_DIAMETER,
+        STATUS_DOT_DIAMETER);
+    const qreal half_border = STATUS_DOT_BORDER_WIDTH / 2.0;
+    painter.drawEllipse(outer_rect.adjusted(
+        half_border,
+        half_border,
+        -half_border,
+        -half_border));
+
+    return QIcon(pixmap);
 }
 
 static const char *get_terminal()
@@ -89,6 +153,11 @@ struct ServiceTray {
     QString service;
     QString label;
 
+    QIcon base_icon;
+    QIcon active_icon;
+    QIcon inactive_icon;
+    QIcon failed_icon;
+
     QMenu menu;
     QSystemTrayIcon tray;
     QTimer timer;
@@ -113,9 +182,14 @@ struct ServiceTray {
     bool status_request_pending = false;
     bool status_refresh_requested = false;
 
-    ServiceTray(QString service_name, QString display_label, bool is_user_service)
+    ServiceTray(
+        QString service_name,
+        QString display_label,
+        bool is_user_service,
+        QIcon service_icon)
         : service(std::move(service_name)),
           label(std::move(display_label)),
+          base_icon(std::move(service_icon)),
           menu(QMenu()),
           tray(QSystemTrayIcon()),
           timer(QTimer()),
@@ -124,6 +198,11 @@ struct ServiceTray {
           bus_timeout(QTimer()),
           user_service(is_user_service)
     {
+        this->active_icon = render_status_icon(this->base_icon, QColor("#2e7d32"));
+        this->inactive_icon = render_status_icon(this->base_icon, QColor("#4a4a4a"));
+        this->failed_icon = render_status_icon(this->base_icon, QColor("#d32f2f"));
+        this->tray.setIcon(this->base_icon);
+
         this->status_action = this->menu.addAction("Status: unknown");
         this->status_action->setEnabled(false);
 
@@ -532,11 +611,11 @@ private:
         }
 
         if (status == ServiceStatus::Active) {
-            this->tray.setIcon(themed_icon({"emblem-default", "dialog-ok-apply", "media-playback-start"}));
+            this->tray.setIcon(this->active_icon);
         } else if (status == ServiceStatus::Failed) {
-            this->tray.setIcon(themed_icon({"dialog-error", "emblem-error"}));
+            this->tray.setIcon(this->failed_icon);
         } else {
-            this->tray.setIcon(themed_icon({"process-stop", "dialog-warning", "emblem-warning"}));
+            this->tray.setIcon(this->inactive_icon);
         }
 
         const QString status_text = this->active_state.isEmpty()
@@ -693,7 +772,7 @@ private:
     void set_unavailable(const QString &reason)
     {
         qWarning("%s", qUtf8Printable(reason));
-        this->tray.setIcon(themed_icon({"dialog-error", "emblem-error"}));
+        this->tray.setIcon(this->base_icon);
         this->tray.setToolTip(this->label + ": unavailable");
         this->status_action->setText("Status: unavailable");
         this->start_action->setEnabled(false);
@@ -729,10 +808,12 @@ int main(int argc, char **argv)
     QCommandLineOption label_option({"l", "label"}, "Display label", "label");
     QCommandLineOption user_option({"u", "user"}, "Monitor a user service instead of a system service");
     QCommandLineOption interval_option({"i", "interval"}, "Refresh interval in seconds", "seconds", "5");
+    QCommandLineOption icon_option("icon", "Base tray icon file", "path");
 
     parser.addOption(label_option);
     parser.addOption(user_option);
     parser.addOption(interval_option);
+    parser.addOption(icon_option);
 
     parser.process(app);
 
@@ -762,8 +843,9 @@ int main(int argc, char **argv)
                               : parser.value(label_option);
 
     const bool user_service = parser.isSet(user_option);
+    QIcon base_icon = load_base_icon(parser.value(icon_option));
 
-    ServiceTray tray{service, label, user_service};
+    ServiceTray tray{service, label, user_service, std::move(base_icon)};
     if (!tray.setup_systemd_connection()) {
         return 1;
     }

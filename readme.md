@@ -1,57 +1,78 @@
 # systemd-tray
 
-`systemd-tray` is a small Linux desktop utility that adds KDE Plasma tray icons for selected `systemd` services.
+`systemd-tray` is a small Qt 6 tray application for monitoring and controlling one systemd service. Run multiple instances to monitor multiple services.
 
-It is meant for desktop services like `ollama`, `postgresql`, local databases, background workers, and other daemons that you want to see and manage visually without constantly using `systemctl`.
+It talks directly to systemd over D-Bus using `libsystemd`/sd-bus.
 
 ## Features
 
-* Show selected `systemd` services in the KDE system tray
-* Display basic service state: running, stopped, failed, activating, unknown
-* Start, stop, restart, and reload services from the tray menu
-* Support both system and user services
-* Open logs/status for a service
-* Configure only the services you care about
-* Uses normal `systemd` permissions and Polkit rules
+- Monitor system or user services.
+- Show the service state in the tooltip and tray menu.
+- Overlay a status dot on the selected icon:
+  - green: active;
+  - dark grey: inactive or transitioning;
+  - red: failed;
+  - no dot: status unavailable.
+- Start, stop, and restart the service through systemd D-Bus.
+- Update immediately from systemd signals, with periodic refresh as a fallback.
+- Use a custom PNG, SVG, or other Qt-supported image as the base icon.
+- Follow the service journal in Konsole.
 
-## Example use cases
+## Requirements
 
-* Show whether `postgresql.service` is running
-* Quickly restart local PostgreSQL
-* Keep an eye on development services
-* Replace ad-hoc terminal checks with persistent tray indicators
+- Linux with systemd and a graphical system tray.
+- A C++23 compiler.
+- CMake 3.20 or newer.
+- Qt 6 Widgets development files.
+- `pkg-config` and the `libsystemd` development files.
+- Konsole and `journalctl` for the optional **Follow logs** action.
 
-## Building
+## Usage
 
-```bash
-cmake -B build -S .
-cmake --build build
+```text
+systemd-tray [options] service
 ```
 
-Install locally:
+Options:
 
-```bash
-cmake --install build
+```text
+-l, --label <label>       Display label
+-u, --user                Monitor a user service instead of a system service
+-i, --interval <seconds>  Fallback refresh interval (default: 5)
+    --icon <path>          Base tray icon file
 ```
 
-## Running
+Monitor a system service:
 
 ```bash
-systemd-tray
+./build-release/systemd-tray postgresql.service
 ```
 
-For development, run directly from the build directory:
+Use a custom label and icon:
 
 ```bash
-./build/systemd-tray
+./build-release/systemd-tray \
+  --label PostgreSQL \
+  --icon /path/to/postgresql.svg \
+  postgresql.service
 ```
 
-## KDE integration
+Monitor a user service:
 
-`systemd-tray` uses the KDE/StatusNotifier tray system, so icons appear in the normal Plasma system tray.
+```bash
+./build-release/systemd-tray --user syncthing.service
+```
+
+To monitor several services, start one instance for each service.
+
+If a custom icon cannot be loaded, the application prints a warning and uses the desktop's `applications-system` icon, with Qt's computer icon as the final fallback. Relative icon paths are resolved from the application's working directory.
 
 ## Permissions
 
-Actions such as starting or stopping system services may require authentication depending on your system configuration.
+Do not run the tray application with `sudo`. Reading system-service state normally works as an unprivileged user and preserves the desktop theme and session environment.
 
-User services can usually be controlled without administrator privileges.
+Starting, stopping, or restarting a system service may trigger a Polkit authentication prompt, depending on the system policy. User-service actions normally require no elevated privileges.
+
+## Service updates
+
+The application keeps one persistent connection to either the system bus or user bus. It subscribes to systemd property-change signals and updates the tray without polling subprocesses. The interval option controls a lightweight D-Bus refresh used as a consistency and reconnection fallback.
